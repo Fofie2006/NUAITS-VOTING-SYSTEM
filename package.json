@@ -1,0 +1,18 @@
+{
+  "name": "nuaits-voting-system",
+  "version": "1.0.0",
+  "description": "NUAITS Online Voting System - Njala University Association of IT Students",
+  "scripts": {
+    "install:all": "npm run install:backend && npm run install:frontend",
+    "install:backend": "cd backend && npm install",
+    "install:frontend": "cd frontend && npm install",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm start",
+    "start:backend": "cd backend && npm start",
+    "build:frontend": "cd frontend && npm run build",
+    "setup": "npm run install:all && echo '\\n✅ Setup complete! See SETUP.md for next steps.'"
+  },
+  "keywords": ["voting", "njala", "nuaits", "election", "react", "nodejs"],
+  "author": "NUAITS Electoral Committee",
+  "license": "MIT"
+}
