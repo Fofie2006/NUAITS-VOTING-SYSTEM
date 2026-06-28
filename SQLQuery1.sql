@@ -1,0 +1,1 @@
+CREATE DATABASE nuaits_voting;
