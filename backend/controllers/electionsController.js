@@ -1,24 +1,35 @@
-const { getPool, sql } = require('../config/database');
+const { getPool } = require('../config/database');
 const { auditLog, getClientIP } = require('../utils/auditLogger');
 
 const getAllElections = async (req, res) => {
   try {
-    const pool = await getPool();
-    const result = await pool.request().query('SELECT * FROM elections ORDER BY created_at DESC');
-    res.json({ success: true, data: result.recordset });
+    const pool = getPool();
+
+    const result = await pool.query(
+      'SELECT * FROM elections ORDER BY created_at DESC'
+    );
+
+    res.json({ success: true, data: result.rows });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ success: false, message: 'Failed to fetch elections' });
   }
 };
 
 const getActiveElection = async (req, res) => {
   try {
-    const pool = await getPool();
-    const result = await pool.request().query(
-      "SELECT TOP 1 * FROM elections WHERE status IN ('active', 'pending') ORDER BY created_at DESC"
+    const pool = getPool();
+
+    const result = await pool.query(
+      `SELECT * FROM elections
+       WHERE status IN ('active','pending')
+       ORDER BY created_at DESC
+       LIMIT 1`
     );
-    res.json({ success: true, data: result.recordset[0] || null });
+
+    res.json({ success: true, data: result.rows[0] || null });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ success: false, message: 'Failed to fetch active election' });
   }
 };
@@ -26,27 +37,40 @@ const getActiveElection = async (req, res) => {
 const createElection = async (req, res) => {
   try {
     const { title, description } = req.body;
-    const pool = await getPool();
+    const pool = getPool();
 
-    // Check for active election
-    const active = await pool.request().query("SELECT id FROM elections WHERE status = 'active'");
-    if (active.recordset.length) {
-      return res.status(400).json({ success: false, message: 'An active election already exists' });
+    const active = await pool.query(
+      "SELECT id FROM elections WHERE status='active'"
+    );
+
+    if (active.rows.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'An active election already exists'
+      });
     }
 
-    const result = await pool.request()
-      .input('title', sql.NVarChar, title)
-      .input('description', sql.NVarChar, description || null)
-      .query(`
-        INSERT INTO elections (title, description, status)
-        OUTPUT INSERTED.id
-        VALUES (@title, @description, 'pending')
-      `);
+    const result = await pool.query(
+      `INSERT INTO elections (title, description, status)
+       VALUES ($1,$2,'pending')
+       RETURNING id`,
+      [title, description || null]
+    );
 
-    const newId = result.recordset[0].id;
-    await auditLog({ action: 'ELECTION_CREATED', description: `Election created: ${title}`, admin_user: req.admin?.username, ip_address: getClientIP(req) });
-    res.status(201).json({ success: true, message: 'Election created', data: { id: newId } });
+    await auditLog({
+      action: 'ELECTION_CREATED',
+      description: `Election created: ${title}`,
+      admin_user: req.admin?.username,
+      ip_address: getClientIP(req)
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Election created',
+      data: { id: result.rows[0].id }
+    });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ success: false, message: 'Failed to create election' });
   }
 };
@@ -54,37 +78,34 @@ const createElection = async (req, res) => {
 const updateElectionStatus = async (req, res) => {
   try {
     const { status, voting_enabled } = req.body;
-    const pool = await getPool();
-    const validStatuses = ['pending', 'active', 'ended'];
+    const pool = getPool();
 
-    if (status && !validStatuses.includes(status)) {
-      return res.status(400).json({ success: false, message: 'Invalid status' });
-    }
-
-    let query = 'UPDATE elections SET ';
-    const updates = [];
-    const req2 = pool.request().input('id', sql.Int, req.params.id);
-
-    if (status !== undefined) {
-      updates.push('status = @status');
-      req2.input('status', sql.NVarChar, status);
-      if (status === 'active') { updates.push('start_time = GETDATE()'); }
-      if (status === 'ended') { updates.push('end_time = GETDATE()', 'voting_enabled = 0'); }
+    if (status) {
+      await pool.query(
+        `UPDATE elections
+         SET status=$1,
+             start_time = CASE WHEN $1='active' THEN NOW() ELSE start_time END,
+             end_time = CASE WHEN $1='ended' THEN NOW() ELSE end_time END,
+             voting_enabled = CASE
+                WHEN $1='ended' THEN false
+                ELSE voting_enabled
+             END
+         WHERE id=$2`,
+        [status, req.params.id]
+      );
     }
 
     if (voting_enabled !== undefined && status !== 'ended') {
-      updates.push('voting_enabled = @voting_enabled');
-      req2.input('voting_enabled', sql.Bit, voting_enabled ? 1 : 0);
+      await pool.query(
+        `UPDATE elections SET voting_enabled=$1 WHERE id=$2`,
+        [voting_enabled, req.params.id]
+      );
     }
 
-    query += updates.join(', ') + ' WHERE id = @id';
-    await req2.query(query);
-
-    const actionMap = { active: 'ELECTION_STARTED', ended: 'ELECTION_ENDED', pending: 'ELECTION_RESET' };
-    const action = status ? (actionMap[status] || 'ELECTION_UPDATED') : 'ELECTION_VOTING_TOGGLED';
-    await auditLog({ action, description: `Election #${req.params.id} status updated`, admin_user: req.admin?.username, ip_address: getClientIP(req) });
-
-    res.json({ success: true, message: 'Election updated successfully' });
+    res.json({
+      success: true,
+      message: 'Election updated successfully'
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: 'Failed to update election' });
@@ -93,56 +114,49 @@ const updateElectionStatus = async (req, res) => {
 
 const getElectionResults = async (req, res) => {
   try {
-    const pool = await getPool();
+    const pool = getPool();
     const electionId = req.params.id;
 
-    const [election, candidateVotes, totalVoters] = await Promise.all([
-      pool.request().input('id', sql.Int, electionId).query('SELECT * FROM elections WHERE id = @id'),
-      pool.request().input('id', sql.Int, electionId).query(`
-        SELECT c.id, c.fullname, c.position, c.photo, c.department,
-               COUNT(v.id) as vote_count
-        FROM candidates c
-        LEFT JOIN votes v ON v.candidate_id = c.id AND v.election_id = @id
-        GROUP BY c.id, c.fullname, c.position, c.photo, c.department
-        ORDER BY c.position, vote_count DESC
-      `),
-      pool.request().input('id', sql.Int, electionId).query(
-        'SELECT COUNT(DISTINCT student_db_id) as total FROM votes WHERE election_id = @id'
-      ),
-    ]);
+    const election = await pool.query(
+      'SELECT * FROM elections WHERE id=$1',
+      [electionId]
+    );
 
-    if (!election.recordset.length) return res.status(404).json({ success: false, message: 'Election not found' });
+    if (!election.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: 'Election not found'
+      });
+    }
 
-    // Group by position
-    const positions = {};
-    candidateVotes.recordset.forEach(c => {
-      if (!positions[c.position]) positions[c.position] = [];
-      positions[c.position].push(c);
-    });
+    const candidateVotes = await pool.query(`
+      SELECT c.id, c.fullname, c.position, c.photo, c.department,
+             COUNT(v.id) AS vote_count
+      FROM candidates c
+      LEFT JOIN votes v
+        ON v.candidate_id = c.id
+       AND v.election_id = ${electionId}
+      GROUP BY c.id
+      ORDER BY c.position
+    `);
 
-    // Add vote percentages and winner per position
-    const results = Object.entries(positions).map(([position, candidates]) => {
-      const totalInPosition = candidates.reduce((sum, c) => sum + c.vote_count, 0);
-      const withPct = candidates.map(c => ({
-        ...c,
-        percentage: totalInPosition > 0 ? ((c.vote_count / totalInPosition) * 100).toFixed(1) : '0.0',
-      }));
-      const winner = withPct[0]; // Already sorted by votes DESC
-      return { position, candidates: withPct, winner, totalVotes: totalInPosition };
-    });
+    const totalVoters = await pool.query(
+      'SELECT COUNT(DISTINCT student_db_id) AS total FROM votes WHERE election_id=$1',
+      [electionId]
+    );
 
-    const totalStudents = (await pool.request().query('SELECT COUNT(*) as total FROM students')).recordset[0].total;
-    const turnout = totalStudents > 0 ? ((totalVoters.recordset[0].total / totalStudents) * 100).toFixed(1) : '0.0';
+    const totalStudents = await pool.query(
+      'SELECT COUNT(*) AS total FROM students'
+    );
 
     res.json({
       success: true,
       data: {
-        election: election.recordset[0],
-        results,
-        totalVoters: totalVoters.recordset[0].total,
-        totalStudents,
-        turnout,
-      },
+        election: election.rows[0],
+        candidates: candidateVotes.rows,
+        totalVoters: totalVoters.rows[0].total,
+        totalStudents: totalStudents.rows[0].total
+      }
     });
   } catch (err) {
     console.error(err);
@@ -150,4 +164,10 @@ const getElectionResults = async (req, res) => {
   }
 };
 
-module.exports = { getAllElections, getActiveElection, createElection, updateElectionStatus, getElectionResults };
+module.exports = {
+  getAllElections,
+  getActiveElection,
+  createElection,
+  updateElectionStatus,
+  getElectionResults
+};

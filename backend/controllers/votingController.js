@@ -1,196 +1,241 @@
-const { getPool, sql } = require('../config/database');
+const { getPool } = require('../config/database');
 const { auditLog, getClientIP } = require('../utils/auditLogger');
 
 /**
- * Step 1: Validate student credentials and return available positions to vote for
+ * STEP 1: VALIDATE CREDENTIALS
  */
 const validateCredentials = async (req, res) => {
   const ip = getClientIP(req);
+
   try {
     const { student_id, voting_code } = req.body;
 
     if (!student_id || !voting_code) {
-      return res.status(400).json({ success: false, message: 'Student ID and voting code are required' });
+      return res.status(400).json({
+        success: false,
+        message: 'Student ID and voting code are required'
+      });
     }
 
-    const pool = await getPool();
+    const pool = getPool();
 
-    // 1. Check for active election with voting enabled
-    const electionResult = await pool.request().query(
-      "SELECT TOP 1 * FROM elections WHERE status = 'active' AND voting_enabled = 1"
+    // Check active election
+    const electionResult = await pool.query(`
+      SELECT * FROM elections
+      WHERE status='active' AND voting_enabled=true
+      ORDER BY created_at DESC
+      LIMIT 1
+    `);
+
+    if (!electionResult.rows.length) {
+      return res.status(403).json({
+        success: false,
+        message: 'Voting is not open'
+      });
+    }
+
+    const election = electionResult.rows[0];
+
+    // Get student
+    const studentResult = await pool.query(
+      `SELECT * FROM students WHERE UPPER(student_id)=UPPER($1)`,
+      [student_id]
     );
 
-    if (!electionResult.recordset.length) {
-      await auditLog({ action: 'VOTE_ATTEMPT_NO_ELECTION', student_id, ip_address: ip, success: false });
-      return res.status(403).json({ success: false, message: 'Voting is not currently open. Please check back later.' });
+    if (!studentResult.rows.length) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
     }
 
-    const election = electionResult.recordset[0];
+    const student = studentResult.rows[0];
 
-    // 2. Look up student
-    const studentResult = await pool.request()
-      .input('student_id', sql.NVarChar, student_id.trim().toUpperCase())
-      .query('SELECT * FROM students WHERE UPPER(student_id) = @student_id');
-
-    if (!studentResult.recordset.length) {
-      await auditLog({ action: 'VOTE_INVALID_STUDENT_ID', student_id, ip_address: ip, success: false, description: 'Student ID not found' });
-      return res.status(401).json({ success: false, message: 'Invalid Student ID or voting code' });
+    if (student.voting_code.toUpperCase() !== voting_code.toUpperCase()) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
     }
 
-    const student = studentResult.recordset[0];
-
-    // 3. Validate voting code
-    const normalizedCode = voting_code.trim().toUpperCase();
-    if (student.voting_code.toUpperCase() !== normalizedCode) {
-      await auditLog({ action: 'VOTE_INVALID_CODE', student_id, ip_address: ip, success: false, description: 'Wrong voting code entered' });
-      return res.status(401).json({ success: false, message: 'Invalid Student ID or voting code' });
-    }
-
-    // 4. Check if code already used
     if (student.code_used) {
-      await auditLog({ action: 'VOTE_CODE_REUSED', student_id, ip_address: ip, success: false, description: 'Attempt to reuse voting code' });
-      return res.status(403).json({ success: false, message: 'This voting code has already been used. Each code is single-use only.' });
+      return res.status(403).json({
+        success: false,
+        message: 'Voting code already used'
+      });
     }
 
-    // 5. Check which positions this student has already voted for (shouldn't happen but safety check)
-    const votedPositions = await pool.request()
-      .input('student_db_id', sql.Int, student.id)
-      .input('election_id', sql.Int, election.id)
-      .query('SELECT position FROM votes WHERE student_db_id = @student_db_id AND election_id = @election_id');
+    // Already voted positions
+    const votedPositions = await pool.query(
+      `SELECT position FROM votes WHERE student_db_id=$1 AND election_id=$2`,
+      [student.id, election.id]
+    );
 
-    const alreadyVotedFor = votedPositions.recordset.map(r => r.position);
+    // 🔥 FIX: Proper image URL handling
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
 
-    // 6. Get candidates
-    const candidates = await pool.request().query('SELECT id, fullname, position, photo, department, manifesto FROM candidates ORDER BY position, fullname');
+    const candidatesResult = await pool.query(`
+      SELECT id, fullname, position, photo, department, manifesto
+      FROM candidates
+      ORDER BY position, fullname
+    `);
 
-    await auditLog({ action: 'VOTE_CREDENTIALS_VALIDATED', student_id, ip_address: ip, description: `Valid credentials for ${student.fullname}` });
+    const candidates = candidatesResult.rows.map(c => ({
+      ...c,
+      photo: c.photo
+        ? (c.photo.startsWith('http')
+            ? c.photo
+            : `${baseUrl}/uploads/candidates/${c.photo}`)
+        : null
+    }));
 
     res.json({
       success: true,
-      message: 'Credentials verified. You may now vote.',
       data: {
         student: {
           name: student.fullname,
           student_id: student.student_id,
           department: student.department,
-          level: student.level,
+          level: student.level
         },
-        election: { id: election.id, title: election.title },
-        candidates: candidates.recordset,
-        alreadyVotedFor,
-      },
+        election: {
+          id: election.id,
+          title: election.title
+        },
+        candidates,
+        alreadyVotedFor: votedPositions.rows.map(r => r.position)
+      }
     });
+
   } catch (err) {
-    console.error('Validate credentials error:', err);
-    await auditLog({ action: 'VOTE_SYSTEM_ERROR', ip_address: ip, success: false, description: err.message });
-    res.status(500).json({ success: false, message: 'An error occurred. Please try again.' });
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
   }
 };
 
+
 /**
- * Step 2: Submit votes (all positions at once)
- * votes: [{ candidate_id, position }, ...]
+ * STEP 2: SUBMIT VOTES
  */
 const submitVotes = async (req, res) => {
+  const pool = getPool();
+  const client = await pool.connect();
   const ip = getClientIP(req);
-  const pool = await getPool();
 
   try {
     const { student_id, voting_code, election_id, votes } = req.body;
 
-    if (!student_id || !voting_code || !election_id || !votes || !Array.isArray(votes) || !votes.length) {
-      return res.status(400).json({ success: false, message: 'Invalid vote submission data' });
+    await client.query('BEGIN');
+
+    // Validate election
+    const election = await client.query(
+      `SELECT * FROM elections
+       WHERE id=$1 AND status='active' AND voting_enabled=true`,
+      [election_id]
+    );
+
+    if (!election.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        success: false,
+        message: 'Voting session ended'
+      });
     }
 
-    // BEGIN TRANSACTION for atomic vote submission
-    const transaction = new (require('mssql').Transaction)(pool);
-    await transaction.begin();
+    // Lock student
+    const studentResult = await client.query(
+      `SELECT * FROM students
+       WHERE UPPER(student_id)=UPPER($1)
+       FOR UPDATE`,
+      [student_id]
+    );
 
-    try {
-      const req2 = new (require('mssql').Request)(transaction);
-
-      // Re-validate everything atomically
-      const electionResult = await req2
-        .input('election_id', sql.Int, election_id)
-        .query("SELECT * FROM elections WHERE id = @election_id AND status = 'active' AND voting_enabled = 1");
-
-      if (!electionResult.recordset.length) {
-        await transaction.rollback();
-        return res.status(403).json({ success: false, message: 'Voting session has ended' });
-      }
-
-      // Lock and validate student row
-      const studentResult = await new (require('mssql').Request)(transaction)
-        .input('student_id', sql.NVarChar, student_id.trim().toUpperCase())
-        .query('SELECT * FROM students WITH (UPDLOCK, ROWLOCK) WHERE UPPER(student_id) = @student_id');
-
-      if (!studentResult.recordset.length) {
-        await transaction.rollback();
-        return res.status(401).json({ success: false, message: 'Invalid credentials' });
-      }
-
-      const student = studentResult.recordset[0];
-
-      if (student.voting_code.toUpperCase() !== voting_code.trim().toUpperCase()) {
-        await transaction.rollback();
-        return res.status(401).json({ success: false, message: 'Invalid credentials' });
-      }
-
-      // Critical: check code_used with row lock
-      if (student.code_used) {
-        await transaction.rollback();
-        return res.status(403).json({ success: false, message: 'This voting code has already been used' });
-      }
-
-      // Insert all votes
-      for (const vote of votes) {
-        await new (require('mssql').Request)(transaction)
-          .input('student_db_id', sql.Int, student.id)
-          .input('student_id', sql.NVarChar, student.student_id)
-          .input('candidate_id', sql.Int, vote.candidate_id)
-          .input('position', sql.NVarChar, vote.position)
-          .input('election_id', sql.Int, election_id)
-          .input('ip_address', sql.NVarChar, ip)
-          .query(`
-            INSERT INTO votes (student_db_id, student_id, candidate_id, position, election_id, ip_address)
-            VALUES (@student_db_id, @student_id, @candidate_id, @position, @election_id, @ip_address)
-          `);
-
-        // Update candidate vote count
-        await new (require('mssql').Request)(transaction)
-          .input('candidate_id', sql.Int, vote.candidate_id)
-          .query('UPDATE candidates SET votes = votes + 1 WHERE id = @candidate_id');
-      }
-
-      // Mark voting code as USED - this is the critical single-use enforcement
-      await new (require('mssql').Request)(transaction)
-        .input('id', sql.Int, student.id)
-        .query('UPDATE students SET code_used = 1 WHERE id = @id');
-
-      await transaction.commit();
-
-      await auditLog({
-        action: 'VOTE_SUBMITTED',
-        student_id: student.student_id,
-        description: `Vote submitted successfully for ${votes.length} position(s)`,
-        ip_address: ip,
-        success: true,
+    if (!studentResult.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
       });
-
-      res.json({
-        success: true,
-        message: 'Your votes have been submitted successfully! Thank you for participating.',
-        data: { votesSubmitted: votes.length },
-      });
-    } catch (txErr) {
-      await transaction.rollback();
-      throw txErr;
     }
+
+    const student = studentResult.rows[0];
+
+    if (student.voting_code.toUpperCase() !== voting_code.toUpperCase()) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+
+    if (student.code_used) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        success: false,
+        message: 'Voting code already used'
+      });
+    }
+
+    // Insert votes
+    for (const vote of votes) {
+      await client.query(
+        `INSERT INTO votes
+        (student_db_id, student_id, candidate_id, position, election_id, ip_address)
+        VALUES ($1,$2,$3,$4,$5,$6)`,
+        [
+          student.id,
+          student.student_id,
+          vote.candidate_id,
+          vote.position,
+          election_id,
+          ip
+        ]
+      );
+
+      await client.query(
+        `UPDATE candidates SET votes = votes + 1 WHERE id=$1`,
+        [vote.candidate_id]
+      );
+    }
+
+    // Mark used
+    await client.query(
+      `UPDATE students SET code_used=true WHERE id=$1`,
+      [student.id]
+    );
+
+    await client.query('COMMIT');
+
+    await auditLog({
+      action: 'VOTE_SUBMITTED',
+      student_id: student.student_id,
+      ip_address: ip,
+      description: `Votes submitted`
+    });
+
+    res.json({
+      success: true,
+      message: 'Vote submitted successfully'
+    });
+
   } catch (err) {
-    console.error('Submit vote error:', err);
-    await auditLog({ action: 'VOTE_SUBMIT_ERROR', ip_address: ip, success: false, description: err.message });
-    res.status(500).json({ success: false, message: 'Failed to submit votes. Please try again.' });
+    await client.query('ROLLBACK');
+    console.error(err);
+
+    res.status(500).json({
+      success: false,
+      message: 'Vote submission failed'
+    });
+
+  } finally {
+    client.release();
   }
 };
 
-module.exports = { validateCredentials, submitVotes };
+module.exports = {
+  validateCredentials,
+  submitVotes
+};
