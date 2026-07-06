@@ -13,87 +13,138 @@ const PORT = process.env.PORT || 5000;
 
 app.set('trust proxy', 1);
 
-// Security
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: 'cross-origin' },
-  contentSecurityPolicy: false,
-}));
+// =========================
+// SECURITY
+// =========================
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    contentSecurityPolicy: false,
+  })
+);
 
-// CORS
-app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-  credentials: true,
-  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-}));
+// =========================
+// CORS (FIXED FOR NETLIFY + LOCAL + MULTI DOMAIN)
+// =========================
+const allowedOrigins = [
+  'http://localhost:3000',
+  'https://nuaits2026.netlify.app',
+  process.env.FRONTEND_URL,
+];
 
-// Rate limiting
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // allow mobile apps / server-to-server (no origin)
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.log('❌ Blocked by CORS:', origin);
+      return callback(new Error('Not allowed by CORS'));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+// =========================
+// RATE LIMITING
+// =========================
 const limiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
   max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
-  message: { success:false, message:'Too many requests. Please try again later.' },
+  message: {
+    success: false,
+    message: 'Too many requests. Please try again later.',
+  },
 });
 
 const votingLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
-  message: { success:false, message:'Too many voting attempts. Please try again in 15 minutes.' },
+  message: {
+    success: false,
+    message: 'Too many voting attempts. Please try again in 15 minutes.',
+  },
 });
 
 app.use(limiter);
 app.use('/api/vote', votingLimiter);
 
-// Body parsing
+// =========================
+// BODY PARSER
+// =========================
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Serve uploaded images
-app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
-  maxAge: '7d',
-  setHeaders: (res) => {
-    res.set('Cross-Origin-Resource-Policy', 'cross-origin');
-  },
-}));
+// =========================
+// STATIC FILES
+// =========================
+app.use(
+  '/uploads',
+  express.static(path.join(__dirname, 'uploads'), {
+    maxAge: '7d',
+    setHeaders: (res) => {
+      res.set('Cross-Origin-Resource-Policy', 'cross-origin');
+    },
+  })
+);
 
-// Routes
+// =========================
+// ROUTES
+// =========================
 app.use('/api', routes);
 
-// 404 handler
+// =========================
+// 404
+// =========================
 app.use((req, res) => {
-  res.status(404).json({ success:false, message:'Route not found' });
+  res.status(404).json({
+    success: false,
+    message: 'Route not found',
+  });
 });
 
-// Error handler
+// =========================
+// ERROR HANDLER
+// =========================
 app.use((err, req, res, next) => {
   if (err.code === 'LIMIT_FILE_SIZE') {
     return res.status(400).json({
-      success:false,
-      message:'File too large. Maximum size is 5MB.'
+      success: false,
+      message: 'File too large. Maximum size is 5MB.',
     });
   }
 
   if (err.message && err.message.includes('Only image')) {
     return res.status(400).json({
-      success:false,
-      message: err.message
+      success: false,
+      message: err.message,
     });
   }
 
   console.error('Unhandled error:', err);
+
   res.status(500).json({
-    success:false,
-    message:'Internal server error'
+    success: false,
+    message: 'Internal server error',
   });
 });
 
-// Start server
+// =========================
+// START SERVER
+// =========================
 const start = async () => {
   await connectDB();
+
   app.listen(PORT, () => {
-    console.log(`\n🚀 NUAITS Voting System Backend`);
+    console.log(`🚀 NUAITS Voting System Backend`);
     console.log(`📡 Server: http://localhost:${PORT}`);
-    console.log(`🖼  Photos: http://localhost:${PORT}/uploads/candidates/`);
-    console.log(`📊 API:    http://localhost:${PORT}/api\n`);
+    console.log(`📊 API: http://localhost:${PORT}/api`);
   });
 };
 

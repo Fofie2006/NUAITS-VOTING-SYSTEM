@@ -4,7 +4,7 @@ const { getPool } = require('../config/database');
 const { auditLog, getClientIP } = require('../utils/auditLogger');
 
 // =====================================================
-// ADMIN LOGIN (POSTGRES VERSION)
+// ADMIN LOGIN
 // =====================================================
 const login = async (req, res) => {
   try {
@@ -25,6 +25,8 @@ const login = async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      console.log("❌ Admin not found:", username);
+
       await auditLog({
         action: 'ADMIN_LOGIN_FAILED',
         description: `Failed login: ${username}`,
@@ -40,7 +42,34 @@ const login = async (req, res) => {
 
     const admin = result.rows[0];
 
-    const validPassword = await bcrypt.compare(password, admin.password_hash);
+    // ==========================
+    // DEBUG OUTPUT
+    // ==========================
+    console.log("\n========== LOGIN DEBUG ==========");
+    console.log("Username entered :", username);
+    console.log("Password entered :", password);
+    console.log("Database ID      :", admin.id);
+    console.log("Database User    :", admin.username);
+    console.log("Database Email   :", admin.email);
+    console.log("Password Hash    :", admin.password_hash);
+    console.log("JWT Exists       :", !!process.env.JWT_SECRET);
+    console.log("=================================\n");
+
+    if (!admin.password_hash) {
+      console.error("❌ password_hash is NULL");
+
+      return res.status(500).json({
+        success: false,
+        message: 'Account not properly configured'
+      });
+    }
+
+    const validPassword = await bcrypt.compare(
+      password,
+      admin.password_hash
+    );
+
+    console.log("Password Match:", validPassword);
 
     if (!validPassword) {
       await auditLog({
@@ -56,6 +85,15 @@ const login = async (req, res) => {
       });
     }
 
+    if (!process.env.JWT_SECRET) {
+      console.error("❌ JWT_SECRET missing");
+
+      return res.status(500).json({
+        success: false,
+        message: 'JWT_SECRET missing'
+      });
+    }
+
     const token = jwt.sign(
       {
         id: admin.id,
@@ -63,14 +101,17 @@ const login = async (req, res) => {
         email: admin.email
       },
       process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
+      {
+        expiresIn: process.env.JWT_EXPIRES_IN || '8h'
+      }
     );
 
     await auditLog({
       action: 'ADMIN_LOGIN',
       description: `Admin logged in: ${admin.username}`,
       admin_user: admin.username,
-      ip_address: getClientIP(req)
+      ip_address: getClientIP(req),
+      success: true
     });
 
     return res.json({
@@ -85,7 +126,8 @@ const login = async (req, res) => {
     });
 
   } catch (err) {
-    console.error('Login error:', err);
+    console.error("LOGIN ERROR:", err);
+
     return res.status(500).json({
       success: false,
       message: 'Server error during login'
@@ -94,7 +136,7 @@ const login = async (req, res) => {
 };
 
 // =====================================================
-// CHANGE PASSWORD (POSTGRES VERSION)
+// CHANGE PASSWORD
 // =====================================================
 const changePassword = async (req, res) => {
   try {
@@ -116,7 +158,10 @@ const changePassword = async (req, res) => {
 
     const admin = result.rows[0];
 
-    const valid = await bcrypt.compare(currentPassword, admin.password_hash);
+    const valid = await bcrypt.compare(
+      currentPassword,
+      admin.password_hash
+    );
 
     if (!valid) {
       return res.status(400).json({
@@ -135,7 +180,8 @@ const changePassword = async (req, res) => {
     await auditLog({
       action: 'ADMIN_PASSWORD_CHANGE',
       admin_user: req.admin.username,
-      ip_address: getClientIP(req)
+      ip_address: getClientIP(req),
+      success: true
     });
 
     return res.json({
@@ -144,7 +190,8 @@ const changePassword = async (req, res) => {
     });
 
   } catch (err) {
-    console.error('Password change error:', err);
+    console.error("Password change error:", err);
+
     return res.status(500).json({
       success: false,
       message: 'Failed to change password'
